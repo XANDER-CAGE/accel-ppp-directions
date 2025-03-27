@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <arpa/inet.h>  // Для inet_ntoa и других функций работы с IP
 
 #include "triton.h"
 #include "events.h"
@@ -125,6 +126,12 @@ static int time_range_id = 0;
 
 #define MAX_IDX 65536
 static long *idx_map;
+
+static void u_inet_ntoa(in_addr_t addr, char *str)
+{
+    struct in_addr in = { addr };
+    strcpy(str, inet_ntoa(in));
+}
 
 static void shaper_ctx_close(struct triton_context_t *);
 static struct triton_context_t shaper_ctx = {
@@ -415,13 +422,12 @@ static void parse_attr(struct rad_attr_t *attr, int dir, int *speed, int *burst,
 
 static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 {
-    struct rad_attr_t *attr;
+	struct rad_attr_t *attr;
     int down_speed, down_burst;
     int up_speed, up_burst;
     int tr_id;
     struct time_range_pd_t *tr_pd;
     int r = 0;
-    char attr_name[64];
     int specific_idx = 0;
     int matched_specific = 0;
 
@@ -435,6 +441,7 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
         tr_pd->act = 0;
 
     pd->cur_tr = NULL;
+
 
     list_for_each_entry(attr, &pack->attrs, entry) {
         // Проверка на стандартные атрибуты (как в оригинальном коде)
@@ -562,9 +569,19 @@ static int install_specific_limiter(struct ap_session *ses, int down_speed, int 
 {
     char cmd[512];
     int res;
+    char ip_str[INET_ADDRSTRLEN];
+    struct ipv4db_item_t *ipv4 = ses->ipv4;
+    
+    // Проверяем наличие IPv4 адреса для сессии
+    if (!ipv4) {
+        log_ppp_error("shaper: no IPv4 address assigned\n");
+        return -1;
+    }
+    
+    // Преобразуем IP-адрес в строку
+    u_inet_ntoa(ipv4->addr, ip_str);
     
     // Устанавливаем tc правила для ограничения скорости по направлению трафика
-    // Здесь используется ipset для фильтрации трафика по назначению
     
     // Пример команды для нисходящего трафика (download)
     if (down_speed > 0) {
@@ -593,7 +610,7 @@ static int install_specific_limiter(struct ap_session *ses, int down_speed, int 
         // и dst адрес из ipset
         snprintf(cmd, sizeof(cmd), 
             "tc filter add dev ifb%d parent 1:0 protocol ip prio %d u32 match ip src %s match ip dst @%s flowid 1:%d", 
-            conf_ifb_ifindex, idx, inet_ntoa(ses->ipv4->addr), ipset, idx);
+            conf_ifb_ifindex, idx, ip_str, ipset, idx);
         res = system(cmd);
         if (res) {
             log_ppp_error("shaper: tc filter add for upload failed: %d\n", res);
