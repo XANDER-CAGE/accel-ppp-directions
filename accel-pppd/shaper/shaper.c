@@ -420,7 +420,7 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 		if (attr->vendor && attr->vendor->id != conf_vendor)
 			continue;
 
-		name = attr->attr->name;
+		const char *name = attr->attr->name;
 		if (!name) continue;
 
 		dir = -1;
@@ -447,7 +447,7 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 			limit = NULL;
 		}
 		if (!limit) {
-			limit = _calloc(1, sizeof(*limit));
+			limit = calloc(1, sizeof(*limit));
 			limit->fwmark = fwmark;
 			list_add_tail(&limit->entry, &pd->fwmark_limits);
 		}
@@ -685,7 +685,7 @@ static int shaper_change_exec(const char *cmd, char * const *f, int f_cnt, void 
 	struct shaper_pd_t *pd;
 	int down_speed = 0, up_speed = 0, down_burst = 0, up_burst = 0;
 	int all = 0, temp = 0, found = 0;
-	int tr_id;
+	//int tr_id;
 
 	if (f_cnt < 4)
 		return CLI_CMD_SYNTAX;

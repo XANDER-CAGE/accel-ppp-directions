@@ -543,7 +543,7 @@ int install_limiter(struct ap_session *ses, int dummy1, int dummy2, int dummy3, 
 	struct rtnl_handle *rth = net->rtnl_get();
 	struct shaper_pd_t *pd = find_pd(ses, 0);
 	struct fwmark_limit_t *limit;
-	int r = 0;
+	int result = 0;
 
 	if (!rth || !pd)
 		return -1;
@@ -555,32 +555,53 @@ int install_limiter(struct ap_session *ses, int dummy1, int dummy2, int dummy3, 
 		int up_burst = conf_up_burst_factor * up;
 
 		if (down > 0) {
-			if (conf_down_limiter == LIM_HTB)
-				r |= install_htb(rth, ses->ifindex, down, down_burst);
-			else if (conf_down_limiter == LIM_TBF)
-				r |= install_tbf(rth, ses->ifindex, down, down_burst);
-			else if (conf_down_limiter == LIM_CLSACT)
-				r |= install_clsact(rth, ses->ifindex, down, down_burst);
+			switch (conf_down_limiter) {
+			case LIM_HTB:
+				if (install_htb(rth, ses->ifindex, down, down_burst))
+					log_warn("shaper: failed to install HTB downstream for fwmark=%d\n", limit->fwmark);
+				break;
+			case LIM_TBF:
+				if (install_tbf(rth, ses->ifindex, down, down_burst))
+					log_warn("shaper: failed to install TBF downstream for fwmark=%d\n", limit->fwmark);
+				break;
+			case LIM_CLSACT:
+				if (install_clsact(rth, ses->ifindex, down, down_burst))
+					log_warn("shaper: failed to install CLSACT downstream for fwmark=%d\n", limit->fwmark);
+				break;
+			default:
+				log_error("shaper: unknown downstream limiter type: %d\n", conf_down_limiter);
+				break;
+			}
 		}
 
 		if (up > 0) {
-			if (conf_up_limiter == LIM_HTB)
-				r |= install_htb_ifb(rth, ses->ifindex, limit->fwmark, up, up_burst);
-			else
-				r |= install_police(rth, ses->ifindex, up, up_burst);
+			switch (conf_up_limiter) {
+			case LIM_HTB:
+				if (install_htb_ifb(rth, ses->ifindex, limit->fwmark, up, up_burst))
+					log_warn("shaper: failed to install HTB upstream via ifb for fwmark=%d\n", limit->fwmark);
+				break;
+			case LIM_POLICE:
+			default:
+				if (install_police(rth, ses->ifindex, up, up_burst))
+					log_warn("shaper: failed to install POLICE upstream for fwmark=%d\n", limit->fwmark);
+				break;
+			}
 		}
 	}
 
+	// Добавляем фильтр fwmark -> classid:1:0, если требуется
 	if (conf_fwmark) {
-		if (conf_down_limiter == LIM_CLSACT)
-			install_fwmark(rth, ses->ifindex, TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS));
-		else
-			install_fwmark(rth, ses->ifindex, 0x00010000);
+		uint32_t parent = (conf_down_limiter == LIM_CLSACT) ?
+			TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS) : 0x00010000;
+
+		if (install_fwmark(rth, ses->ifindex, parent))
+			log_warn("shaper: failed to install fwmark filter (fwmark=%d) on %s\n", conf_fwmark, ses->ifname);
 	}
 
 	net->rtnl_put(rth);
-	return r;
+	return result;
 }
+
 
 
 int remove_limiter(struct ap_session *ses, int idx)
@@ -588,22 +609,71 @@ int remove_limiter(struct ap_session *ses, int idx)
 	struct rtnl_handle *rth = net->rtnl_get();
 	struct shaper_pd_t *pd = find_pd(ses, 0);
 	struct fwmark_limit_t *limit;
+	int result = 0;
 
 	if (!rth || !pd)
 		return -1;
 
-	remove_root(rth, ses->ifindex);
-	remove_ingress(rth, ses->ifindex);
+	// Удаляем downstream qdisc
+	switch (conf_down_limiter) {
+	case LIM_HTB:
+	case LIM_TBF:
+		if (remove_root(rth, ses->ifindex)) {
+			log_warn("shaper: failed to remove root qdisc from %s\n", ses->ifname);
+			result = -1;
+		}
+		break;
+	case LIM_CLSACT:
+		if (tc_qdisc_modify(rth, ses->ifindex, RTM_DELQDISC, 0,
+				&(struct qdisc_opt){ .handle = TC_H_MAKE(TC_H_CLSACT, 0), .parent = TC_H_CLSACT })) {
+			log_warn("shaper: failed to remove clsact qdisc from %s\n", ses->ifname);
+			result = -1;
+		}
+		break;
+	default:
+		log_error("shaper: unknown downstream limiter type %d\n", conf_down_limiter);
+		result = -1;
+	}
 
-	if (conf_up_limiter == LIM_HTB) {
+	// Удаляем upstream qdisc или фильтры
+	switch (conf_up_limiter) {
+	case LIM_HTB:
 		list_for_each_entry(limit, &pd->fwmark_limits, entry) {
-			remove_htb_ifb(rth, ses->ifindex, limit->fwmark);
+			if (remove_htb_ifb(rth, ses->ifindex, limit->fwmark)) {
+				log_warn("shaper: failed to remove ifb class for fwmark=%d\n", limit->fwmark);
+				result = -1;
+			}
+		}
+		break;
+	case LIM_POLICE:
+	default:
+		if (remove_ingress(rth, ses->ifindex)) {
+			log_warn("shaper: failed to remove ingress qdisc from %s\n", ses->ifname);
+			result = -1;
+		}
+		break;
+	}
+
+	// ❗ Удаление фильтра по fwmark (если был установлен)
+	if (conf_fwmark) {
+		uint32_t parent = (conf_down_limiter == LIM_CLSACT) ?
+			TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_EGRESS) : 0x00010000;
+
+		// Удалим фильтр с fwmark = conf_fwmark
+		struct qdisc_opt del_filter = {
+			.parent = parent,
+			.handle = conf_fwmark,
+		};
+
+		if (tc_qdisc_modify(rth, ses->ifindex, RTM_DELTFILTER, 0, &del_filter)) {
+			log_warn("shaper: failed to remove fwmark filter from %s\n", ses->ifname);
 		}
 	}
 
 	net->rtnl_put(rth);
-	return 0;
+	return result;
 }
+
 
 int init_ifb(const char *name)
 {

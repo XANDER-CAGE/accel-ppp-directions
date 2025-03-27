@@ -24,6 +24,18 @@ struct qdisc_opt {
 	int (*qdisc)(struct qdisc_opt *opt, struct nlmsghdr *n);
 };
 
+struct fwmark_limit_t {
+	struct list_head entry;
+	int fwmark;
+	int down_speed;
+	int down_burst;
+	int up_speed;
+	int up_burst;
+};
+
+struct shaper_pd_t *find_pd(struct ap_session *ses, int create);
+
+
 extern int conf_up_limiter;
 extern int conf_down_limiter;
 
