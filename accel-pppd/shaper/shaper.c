@@ -393,22 +393,23 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 {
 	struct rad_attr_t *attr;
 	struct time_range_pd_t *tr_pd;
-	int tr_id = 0;
+	int tr_id;
 	int down_speed = 0, down_burst = 0;
 	int up_speed = 0, up_burst = 0;
 	int r = 0;
-	int max_tr_id = -1;
 
-	// 👇 сначала объявляем переменную, потом используем
+	// Отмечаем все профили как неактивные
 	list_for_each_entry(tr_pd, &pd->tr_list, entry)
 		tr_pd->act = 0;
 
+	// Парсим все атрибуты
 	list_for_each_entry(attr, &pack->attrs, entry) {
 		if (attr->vendor && attr->vendor->id != conf_vendor)
 			continue;
 		if (!attr->vendor && conf_vendor)
 			continue;
 
+		// Downstream
 		if (strncmp(attr->attr->name, "PPPD-Downstream-Speed-Limit", 28) == 0) {
 			tr_id = atoi(attr->attr->name + 28);
 			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, NULL);
@@ -416,16 +417,17 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 			if (down_speed) tr_pd->down_speed = down_speed;
 			if (down_burst) tr_pd->down_burst = down_burst;
 			tr_pd->act = 1;
-			if (tr_id > max_tr_id) max_tr_id = tr_id;
 			r = 1;
-		} else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
+		}
+
+		// Upstream
+		else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
 			tr_id = atoi(attr->attr->name + 26);
 			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, NULL);
 			tr_pd = get_tr_pd(pd, tr_id);
 			if (up_speed) tr_pd->up_speed = up_speed;
 			if (up_burst) tr_pd->up_burst = up_burst;
 			tr_pd->act = 1;
-			if (tr_id > max_tr_id) max_tr_id = tr_id;
 			r = 1;
 		}
 	}
@@ -433,12 +435,22 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 	if (!r)
 		return 0;
 
-	if (max_tr_id >= 0)
-		pd->cur_tr = get_tr_pd(pd, max_tr_id);
+	// Текущий профиль выбираем с max скоростью
+	struct time_range_pd_t *best = NULL;
+	list_for_each_entry(tr_pd, &pd->tr_list, entry) {
+		if (tr_pd->act) {
+			if (!best || tr_pd->down_speed + tr_pd->up_speed > best->down_speed + best->up_speed)
+				best = tr_pd;
+		}
+	}
+
+	if (best)
+		pd->cur_tr = best;
 
 	clear_old_tr_pd(pd);
 	return 1;
 }
+
 
 
 
