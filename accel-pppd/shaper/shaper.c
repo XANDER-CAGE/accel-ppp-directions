@@ -326,26 +326,25 @@ static struct time_range_pd_t *get_tr_pd(struct shaper_pd_t *pd, int id)
 	list_for_each_entry(tr_pd, &pd->tr_list, entry) {
 		if (tr_pd->id == id) {
 			tr_pd->act = 1;
-			if (id == time_range_id)
-				pd->cur_tr = tr_pd;
+			pd->cur_tr = tr_pd;  // 👈 обязательно
 			return tr_pd;
 		}
 	}
 
 	tr_pd = _malloc(sizeof(*tr_pd));
+	if (!tr_pd)
+		return NULL;
 	memset(tr_pd, 0, sizeof(*tr_pd));
 	tr_pd->id = id;
 	tr_pd->act = 1;
 
-	//if (id == time_range_id)
-	//	pd->cur_tr = tr_pd;
-
-	pd->cur_tr = tr_pd;
-
 	list_add_tail(&tr_pd->entry, &pd->tr_list);
+
+	pd->cur_tr = tr_pd;  // 👈 выставляем cur_tr на вновь созданный профиль
 
 	return tr_pd;
 }
+
 
 static void clear_tr_pd(struct shaper_pd_t *pd)
 {
