@@ -538,62 +538,36 @@ static int remove_htb_ifb(struct rtnl_handle *rth, int ifindex, int priority)
 	return tc_qdisc_modify(rth, conf_ifb_ifindex, RTM_DELTCLASS, 0, &opt);
 }
 
-int install_limiter_marked(struct ap_session *ses, int down_speed, int down_burst, int up_speed, int up_burst, int idx, int fwmark) {
-    struct tc_limiter_config cfg;
-    memset(&cfg, 0, sizeof(cfg));
-
-    strncpy(cfg.ifname, ses->ifname, sizeof(cfg.ifname) - 1);
-    cfg.down_kbit = down_speed;
-    cfg.down_burst = down_burst;
-    cfg.up_kbit = up_speed;
-    cfg.up_burst = up_burst;
-    cfg.idx = idx;
-    cfg.fwmark = fwmark;
-
-    return tc_install_limiter(&cfg);
-}
-
-int install_limiter(struct ap_session *ses, int down_speed, int down_burst, int up_speed, int up_burst, int idx)
+int install_limiter(struct ap_session *ses, int dummy1, int dummy2, int dummy3, int dummy4, int idx)
 {
 	struct rtnl_handle *rth = net->rtnl_get();
+	struct shaper_pd_t *pd = find_pd(ses, 0);
+	struct fwmark_limit_t *limit;
 	int r = 0;
 
-	if (!rth) {
-		log_ppp_error("shaper: cannot open rtnetlink\n");
+	if (!rth || !pd)
 		return -1;
-	}
 
-	if (down_speed) {
-		down_speed = down_speed * 1000 / 8;
-		down_burst = down_burst ? down_burst : conf_down_burst_factor * down_speed;
+	list_for_each_entry(limit, &pd->fwmark_limits, entry) {
+		int down = limit->down_speed * 1000 / 8;
+		int down_burst = conf_down_burst_factor * down;
+		int up = limit->up_speed * 1000 / 8;
+		int up_burst = conf_up_burst_factor * up;
 
-		if (conf_down_limiter == LIM_TBF) {
-			r = install_tbf(rth, ses->ifindex, down_speed, down_burst);
-			if (r == 0)
-				r = install_leaf_qdisc(rth, ses->ifindex, 0x00010000, 0x00020000);
-		} else if (conf_down_limiter == LIM_CLSACT)
-			r = install_clsact(rth, ses->ifindex, down_speed, down_burst);
-		else {
-			r = install_htb(rth, ses->ifindex, down_speed, down_burst);
-			if (r == 0)
-				r = install_leaf_qdisc(rth, ses->ifindex, 0x00010001, 0x00020000);
+		if (down > 0) {
+			if (conf_down_limiter == LIM_HTB)
+				r |= install_htb(rth, ses->ifindex, down, down_burst);
+			else if (conf_down_limiter == LIM_TBF)
+				r |= install_tbf(rth, ses->ifindex, down, down_burst);
+			else if (conf_down_limiter == LIM_CLSACT)
+				r |= install_clsact(rth, ses->ifindex, down, down_burst);
 		}
-	}
 
-	if (up_speed) {
-		up_speed = up_speed * 1000 / 8;
-		up_burst = up_burst ? up_burst : conf_up_burst_factor * up_speed;
-
-		if (conf_up_limiter == LIM_POLICE) {
-			/* if clsact is used for down_limiter then normal policer doesn't work, use clsact version */
-			if (conf_down_limiter == LIM_CLSACT && down_speed)
-				r = install_police_clsact(rth, ses->ifindex, up_speed, up_burst, TC_H_MIN_INGRESS);
+		if (up > 0) {
+			if (conf_up_limiter == LIM_HTB)
+				r |= install_htb_ifb(rth, ses->ifindex, limit->fwmark, up, up_burst);
 			else
-				r = install_police(rth, ses->ifindex, up_speed, up_burst);
-		} else {
-			r = install_htb_ifb(rth, ses->ifindex, idx, up_speed, up_burst);
-			if (r == 0)
-				r = install_leaf_qdisc(rth, conf_ifb_ifindex, 0x00010000 + idx, idx << 16);
+				r |= install_police(rth, ses->ifindex, up, up_burst);
 		}
 	}
 
@@ -605,27 +579,29 @@ int install_limiter(struct ap_session *ses, int down_speed, int down_burst, int 
 	}
 
 	net->rtnl_put(rth);
-
 	return r;
 }
+
 
 int remove_limiter(struct ap_session *ses, int idx)
 {
 	struct rtnl_handle *rth = net->rtnl_get();
+	struct shaper_pd_t *pd = find_pd(ses, 0);
+	struct fwmark_limit_t *limit;
 
-	if (!rth) {
-		log_ppp_error("shaper: cannot open rtnetlink\n");
+	if (!rth || !pd)
 		return -1;
-	}
 
 	remove_root(rth, ses->ifindex);
 	remove_ingress(rth, ses->ifindex);
 
-	if (conf_up_limiter == LIM_HTB)
-		remove_htb_ifb(rth, ses->ifindex, idx);
+	if (conf_up_limiter == LIM_HTB) {
+		list_for_each_entry(limit, &pd->fwmark_limits, entry) {
+			remove_htb_ifb(rth, ses->ifindex, limit->fwmark);
+		}
+	}
 
 	net->rtnl_put(rth);
-
 	return 0;
 }
 

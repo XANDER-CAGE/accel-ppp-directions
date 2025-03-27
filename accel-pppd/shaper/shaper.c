@@ -71,19 +71,18 @@ static int dflt_up_speed;
 static pthread_rwlock_t shaper_lock = PTHREAD_RWLOCK_INITIALIZER;
 static LIST_HEAD(shaper_list);
 
-struct extra_shaper_t {
-	int id;
-	int down_speed;
-	int up_speed;
-	int down_burst;
-	int up_burst;
-	int fwmark;
+struct time_range_pd_t;
+
+struct fwmark_limit_t {
 	struct list_head entry;
+	int fwmark;
+	int down_speed;
+	int down_burst;
+	int up_speed;
+	int up_burst;
 };
 
-struct time_range_pd_t;
 struct shaper_pd_t {
-	struct list_head extra_list;
 	struct list_head entry;
 	struct ap_session *ses;
 	struct ap_private pd;
@@ -93,6 +92,7 @@ struct shaper_pd_t {
 	int up_speed;
 	struct list_head tr_list;
 	struct time_range_pd_t *cur_tr;
+	struct list_head fwmark_limits;
 	int refs;
 	int idx;
 };
@@ -194,7 +194,7 @@ static struct shaper_pd_t *find_pd(struct ap_session *ses, int create)
 		list_add_tail(&spd->pd.entry, &ses->pd_list);
 		spd->pd.key = &pd_key;
 		INIT_LIST_HEAD(&spd->tr_list);
-		INIT_LIST_HEAD(&spd->extra_list);
+		INIT_LIST_HEAD(&spd->fwmark_limits);
 		spd->refs = 1;
 
 		pthread_rwlock_wrlock(&shaper_lock);
@@ -403,91 +403,64 @@ static void parse_attr(struct rad_attr_t *attr, int dir, int *speed, int *burst,
 static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 {
 	struct rad_attr_t *attr;
-	int down_speed, down_burst;
-	int up_speed, up_burst;
-	int tr_id;
-	struct time_range_pd_t *tr_pd;
-	int r = 0;
+	int dir, rate, tr_id;
+	char *name;
+	int fwmark;
+	struct fwmark_limit_t *limit;
+	struct list_head *pos, *n;
 
-	list_for_each_entry(tr_pd, &pd->tr_list, entry)
-		tr_pd->act = 0;
-
-	pd->cur_tr = NULL;
+	// Удалим старые лимиты
+	list_for_each_safe(pos, n, &pd->fwmark_limits) {
+		limit = list_entry(pos, struct fwmark_limit_t, entry);
+		list_del(&limit->entry);
+		_free(limit);
+	}
 
 	list_for_each_entry(attr, &pack->attrs, entry) {
 		if (attr->vendor && attr->vendor->id != conf_vendor)
 			continue;
-		if (!attr->vendor && conf_vendor)
-			continue;
-		if (attr->attr->id != conf_attr_down && attr->attr->id != conf_attr_up)
-			continue;
-		r = 1;
-		tr_id = 0;
-		down_speed = 0;
-		down_burst = 0;
-		up_speed = 0;
-		up_burst = 0;
-		if (attr->attr->id == conf_attr_down)
-			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, &tr_id);
-		if (attr->attr->id == conf_attr_up)
-			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, &tr_id);
-		tr_pd = get_tr_pd(pd, tr_id);
-		if (down_speed)
-			tr_pd->down_speed = down_speed;
-		if (down_burst)
-			tr_pd->down_burst = down_burst;
-		if (up_speed)
-			tr_pd->up_speed = up_speed;
-		if (up_burst)
-			tr_pd->up_burst = up_burst;
+
+		name = attr->attr->name;
+		if (!name) continue;
+
+		dir = -1;
+		fwmark = 0;
+
+		if (strncmp(name, "PPPD-Downstream-Speed-Limit", 27) == 0) {
+			dir = ATTR_DOWN;
+			if (name[27] == '-') fwmark = atoi(&name[28]);
+		}
+		else if (strncmp(name, "PPPD-Upstream-Speed-Limit", 25) == 0) {
+			dir = ATTR_UP;
+			if (name[25] == '-') fwmark = atoi(&name[26]);
+		}
+		if (dir == -1) continue;
+
+		rate = (attr->attr->type == ATTR_TYPE_INTEGER)
+			? attr->val.integer
+			: atoi(attr->val.string); // или парси лучше
+
+		// Ищем или создаём limit
+		limit = NULL;
+		list_for_each_entry(limit, &pd->fwmark_limits, entry) {
+			if (limit->fwmark == fwmark) break;
+			limit = NULL;
+		}
+		if (!limit) {
+			limit = _calloc(1, sizeof(*limit));
+			limit->fwmark = fwmark;
+			list_add_tail(&limit->entry, &pd->fwmark_limits);
+		}
+
+		if (dir == ATTR_DOWN)
+			limit->down_speed = rate;
+		else
+			limit->up_speed = rate;
 	}
 
-	if (!r)
-		return 0;
-
-	if (!pd->cur_tr)
-		pd->cur_tr = get_tr_pd(pd, 0);
-
-	clear_old_tr_pd(pd);
-
-	list_for_each_entry(attr, &pack->attrs, entry) {
-		if (!attr->attr || !attr->attr->name || attr->attr->type != ATTR_TYPE_INTEGER)
-			continue;
-	
-		const char *name = attr->attr->name;
-		int id = 0, is_up = 0, is_down = 0;
-	
-		if (sscanf(name, "PPPD-Upstream-Speed-Limit-%d", &id) == 1)
-			is_up = 1;
-		else if (sscanf(name, "PPPD-Downstream-Speed-Limit-%d", &id) == 1)
-			is_down = 1;
-	
-		if ((is_up || is_down) && id > 0) {
-			struct extra_shaper_t *es = NULL;
-	
-			list_for_each_entry(es, &pd->extra_list, entry) {
-				if (es->id == id) break;
-				es = NULL;
-			}
-	
-			if (!es) {
-				es = _malloc(sizeof(*es));
-				if (!es) continue;
-				memset(es, 0, sizeof(*es));
-				es->id = id;
-				es->fwmark = 100 + id; // Марка 101, 102, ...
-				list_add_tail(&es->entry, &pd->extra_list);
-			}
-	
-			if (is_up)
-				es->up_speed = conf_multiplier * attr->val.integer;
-			if (is_down)
-				es->down_speed = conf_multiplier * attr->val.integer;
-		}
-	}	
-
-	return 1;
+	return !list_empty(&pd->fwmark_limits);
 }
+
 
 static void ev_radius_access_accept(struct ev_radius_t *ev)
 {
@@ -645,16 +618,6 @@ static void ev_ppp_pre_up(struct ap_session *ses)
 				log_ppp_info2("shaper: installed shaper %i/%i (Kbit)\n", down_speed, up_speed);
 		}
 	}
-
-	struct extra_shaper_t *es;
-	list_for_each_entry(es, &pd->extra_list, entry) {
-		if (es->up_speed || es->down_speed) {
-			es->idx = alloc_idx(ses->ifindex);
-			install_limiter_marked(ses, es->down_speed, es->down_burst, es->up_speed, es->up_burst, es->idx, es->fwmark);
-			if (conf_verbose)
-				log_ppp_info2("shaper: installed extra shaper id=%d fwmark=%d %d/%d (Kbit)\n", es->id, es->fwmark, es->down_speed, es->up_speed);
-		}
-	}
 }
 
 static void ev_ppp_finishing(struct ap_session *ses)
@@ -673,21 +636,11 @@ static void ev_ppp_finishing(struct ap_session *ses)
 		if (pd->down_speed || pd->up_speed)
 			remove_limiter(ses, pd->idx);
 
-		// Удаление дополнительных шейперов
-		struct extra_shaper_t *es, *tmp;
-		list_for_each_entry_safe(es, tmp, &pd->extra_list, entry) {
-			remove_limiter(ses, es->idx);
-			free_idx(es->idx);
-			list_del(&es->entry);
-			_free(es);
-		}
-
 		if (__sync_sub_and_fetch(&pd->refs, 1) == 0) {
 			clear_tr_pd(pd);
 			_free(pd);
-		} else {
+		} else
 			pd->ses = NULL;
-		}
 	}
 }
 
