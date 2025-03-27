@@ -105,7 +105,7 @@ struct time_range_t {
 
 static void *pd_key;
 
-static LIST_HEAD(time_range_list);
+//static LIST_HEAD(time_range_list);
 //static int time_range_id = 0;
 
 #define MAX_IDX 65536
@@ -1218,7 +1218,7 @@ static void load_config(void)
 	if (opt)
 		parse_dflt_shaper(opt, &dflt_down_speed, &dflt_up_speed);
 
-	triton_context_call(&shaper_ctx, (triton_event_func)load_time_ranges, NULL);
+	//triton_context_call(&shaper_ctx, (triton_event_func)load_time_ranges, NULL);
 }
 
 static void init(void)
