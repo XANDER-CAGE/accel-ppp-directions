@@ -846,7 +846,7 @@ static void shaper_ctx_close(struct triton_context_t *ctx)
 	triton_context_unregister(ctx);
 }
 
-static void update_shaper_tr(struct shaper_pd_t *pd)
+/*static void update_shaper_tr(struct shaper_pd_t *pd)
 {
 	goto out;
 
@@ -891,9 +891,9 @@ out:
 		clear_tr_pd(pd);
 		_free(pd);
 	}
-}
+} */
 
-static void time_range_begin_timer(struct triton_timer_t *t)
+/*static void time_range_begin_timer(struct triton_timer_t *t)
 {
 	struct time_range_t *tr = container_of(t, typeof(*tr), begin);
 	struct shaper_pd_t *pd;
@@ -966,7 +966,7 @@ static struct time_range_t *parse_range(time_t t, const char *val)
 	r->end.expire = time_range_end_timer;
 
 	return r;
-}
+} */
 
 static int parse_dflt_shaper(const char *opt, int *down_speed, int *up_speed)
 {
@@ -984,7 +984,7 @@ static int parse_dflt_shaper(const char *opt, int *down_speed, int *up_speed)
 	return 0;
 }
 
-static void load_time_ranges(void)
+/*static void load_time_ranges(void)
 {
 	struct conf_sect_t *s = conf_get_section("shaper");
 	struct conf_option_t *opt;
@@ -1044,7 +1044,7 @@ static void load_time_ranges(void)
 		if (r->end.period)
 			triton_timer_add(&shaper_ctx, &r->end, 1);
 	}
-}
+} */
 
 #ifdef RADIUS
 static int parse_attr_opt(const char *opt)
