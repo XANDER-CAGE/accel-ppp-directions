@@ -32,6 +32,8 @@
 #define ATTR_UP 1
 #define ATTR_DOWN 2
 
+#define MAX_SPECIFIC_SHAPERS 5  // Максимальное количество дополнительных шейперов
+
 static int conf_verbose = 0;
 #ifdef RADIUS
 static int conf_attr_down = 11; //Filter-Id
@@ -71,20 +73,33 @@ static int dflt_up_speed;
 static pthread_rwlock_t shaper_lock = PTHREAD_RWLOCK_INITIALIZER;
 static LIST_HEAD(shaper_list);
 
+struct specific_shaper_t {
+    int down_speed;
+    int up_speed;
+    char *dest_ipset;  // Имя ipset, содержащего целевые сети
+    int idx;           // Идентификатор шейпера
+    int active;        // Флаг активности шейпера
+};
+
 struct time_range_pd_t;
 struct shaper_pd_t {
-	struct list_head entry;
-	struct ap_session *ses;
-	struct ap_private pd;
-	int temp_down_speed;
-	int temp_up_speed;
-	int down_speed;
-	int up_speed;
-	struct list_head tr_list;
-	struct time_range_pd_t *cur_tr;
-	int refs;
-	int idx;
+    struct list_head entry;
+    struct ap_session *ses;
+    struct ap_private pd;
+    int temp_down_speed;
+    int temp_up_speed;
+    int down_speed;
+    int up_speed;
+    struct list_head tr_list;
+    struct time_range_pd_t *cur_tr;
+    int refs;
+    int idx;
+    
+    // Добавляем поддержку дополнительных шейперов
+    struct specific_shaper_t specific_shapers[MAX_SPECIFIC_SHAPERS];
+    int num_specific_shapers;
 };
+
 
 struct time_range_pd_t {
 	struct list_head entry;
@@ -105,8 +120,8 @@ struct time_range_t {
 
 static void *pd_key;
 
-//static LIST_HEAD(time_range_list);
-//static int time_range_id = 0;
+static LIST_HEAD(time_range_list);
+static int time_range_id = 0;
 
 #define MAX_IDX 65536
 static long *idx_map;
@@ -161,37 +176,47 @@ static void free_idx(int idx)
 
 static struct shaper_pd_t *find_pd(struct ap_session *ses, int create)
 {
-	struct ap_private *pd;
-	struct shaper_pd_t *spd;
+    struct ap_private *pd;
+    struct shaper_pd_t *spd;
 
-	list_for_each_entry(pd, &ses->pd_list, entry) {
-		if (pd->key == &pd_key) {
-			spd = container_of(pd, typeof(*spd), pd);
-			return spd;
-		}
-	}
+    list_for_each_entry(pd, &ses->pd_list, entry) {
+        if (pd->key == &pd_key) {
+            spd = container_of(pd, typeof(*spd), pd);
+            return spd;
+        }
+    }
 
-	if (create) {
-		spd = _malloc(sizeof(*spd));
-		if (!spd) {
-			log_emerg("shaper: out of memory\n");
-			return NULL;
-		}
+    if (create) {
+        spd = _malloc(sizeof(*spd));
+        if (!spd) {
+            log_emerg("shaper: out of memory\n");
+            return NULL;
+        }
 
-		memset(spd, 0, sizeof(*spd));
-		spd->ses = ses;
-		list_add_tail(&spd->pd.entry, &ses->pd_list);
-		spd->pd.key = &pd_key;
-		INIT_LIST_HEAD(&spd->tr_list);
-		spd->refs = 1;
+        memset(spd, 0, sizeof(*spd));
+        spd->ses = ses;
+        list_add_tail(&spd->pd.entry, &ses->pd_list);
+        spd->pd.key = &pd_key;
+        INIT_LIST_HEAD(&spd->tr_list);
+        spd->refs = 1;
+        
+        // Инициализируем структуру дополнительных шейперов
+        for (int i = 0; i < MAX_SPECIFIC_SHAPERS; i++) {
+            spd->specific_shapers[i].idx = 0;
+            spd->specific_shapers[i].down_speed = 0;
+            spd->specific_shapers[i].up_speed = 0;
+            spd->specific_shapers[i].dest_ipset = NULL;
+            spd->specific_shapers[i].active = 0;
+        }
+        spd->num_specific_shapers = 0;
 
-		pthread_rwlock_wrlock(&shaper_lock);
-		list_add_tail(&spd->entry, &shaper_list);
-		pthread_rwlock_unlock(&shaper_lock);
-		return spd;
-	}
+        pthread_rwlock_wrlock(&shaper_lock);
+        list_add_tail(&spd->entry, &shaper_list);
+        pthread_rwlock_unlock(&shaper_lock);
+        return spd;
+    }
 
-	return NULL;
+    return NULL;
 }
 
 static long int parse_integer(const char *str, char **endptr, double *multiplier)
@@ -326,25 +351,24 @@ static struct time_range_pd_t *get_tr_pd(struct shaper_pd_t *pd, int id)
 	list_for_each_entry(tr_pd, &pd->tr_list, entry) {
 		if (tr_pd->id == id) {
 			tr_pd->act = 1;
-			pd->cur_tr = tr_pd;  // 👈 обязательно
+			if (id == time_range_id)
+				pd->cur_tr = tr_pd;
 			return tr_pd;
 		}
 	}
 
 	tr_pd = _malloc(sizeof(*tr_pd));
-	if (!tr_pd)
-		return NULL;
 	memset(tr_pd, 0, sizeof(*tr_pd));
 	tr_pd->id = id;
 	tr_pd->act = 1;
 
-	list_add_tail(&tr_pd->entry, &pd->tr_list);
+	if (id == time_range_id)
+		pd->cur_tr = tr_pd;
 
-	pd->cur_tr = tr_pd;  // 👈 выставляем cur_tr на вновь созданный профиль
+	list_add_tail(&tr_pd->entry, &pd->tr_list);
 
 	return tr_pd;
 }
-
 
 static void clear_tr_pd(struct shaper_pd_t *pd)
 {
@@ -391,68 +415,138 @@ static void parse_attr(struct rad_attr_t *attr, int dir, int *speed, int *burst,
 
 static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 {
-	struct rad_attr_t *attr;
-	struct time_range_pd_t *tr_pd;
-	int tr_id;
-	int down_speed = 0, down_burst = 0;
-	int up_speed = 0, up_burst = 0;
-	int r = 0;
+    struct rad_attr_t *attr;
+    int down_speed, down_burst;
+    int up_speed, up_burst;
+    int tr_id;
+    struct time_range_pd_t *tr_pd;
+    int r = 0;
+    char attr_name[64];
+    int specific_idx = 0;
+    int matched_specific = 0;
 
-	// Отмечаем все профили как неактивные
-	list_for_each_entry(tr_pd, &pd->tr_list, entry)
-		tr_pd->act = 0;
+    // Сбрасываем флаги активности для дополнительных шейперов
+    for (int i = 0; i < pd->num_specific_shapers; i++) {
+        pd->specific_shapers[i].active = 0;
+    }
 
-	// Парсим все атрибуты
-	list_for_each_entry(attr, &pack->attrs, entry) {
-		if (attr->vendor && attr->vendor->id != conf_vendor)
-			continue;
-		if (!attr->vendor && conf_vendor)
-			continue;
+    // Обработка обычных атрибутов (существующий код)
+    list_for_each_entry(tr_pd, &pd->tr_list, entry)
+        tr_pd->act = 0;
 
-		// Downstream
-		if (strncmp(attr->attr->name, "PPPD-Downstream-Speed-Limit", 28) == 0) {
-			tr_id = atoi(attr->attr->name + 28);
-			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, NULL);
-			tr_pd = get_tr_pd(pd, tr_id);
-			if (down_speed) tr_pd->down_speed = down_speed;
-			if (down_burst) tr_pd->down_burst = down_burst;
-			tr_pd->act = 1;
-			r = 1;
-		}
+    pd->cur_tr = NULL;
 
-		// Upstream
-		else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
-			tr_id = atoi(attr->attr->name + 26);
-			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, NULL);
-			tr_pd = get_tr_pd(pd, tr_id);
-			if (up_speed) tr_pd->up_speed = up_speed;
-			if (up_burst) tr_pd->up_burst = up_burst;
-			tr_pd->act = 1;
-			r = 1;
-		}
-	}
+    list_for_each_entry(attr, &pack->attrs, entry) {
+        // Проверка на стандартные атрибуты (как в оригинальном коде)
+        if (attr->vendor && attr->vendor->id != conf_vendor)
+            continue;
+        if (!attr->vendor && conf_vendor)
+            continue;
+        
+        // Обработка стандартных атрибутов для основного шейпера
+        if (attr->attr->id == conf_attr_down || attr->attr->id == conf_attr_up) {
+            r = 1;
+            tr_id = 0;
+            down_speed = 0;
+            down_burst = 0;
+            up_speed = 0;
+            up_burst = 0;
+            if (attr->attr->id == conf_attr_down)
+                parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, &tr_id);
+            if (attr->attr->id == conf_attr_up)
+                parse_attr(attr, ATTR_UP, &up_speed, &up_burst, &tr_id);
+            tr_pd = get_tr_pd(pd, tr_id);
+            if (down_speed)
+                tr_pd->down_speed = down_speed;
+            if (down_burst)
+                tr_pd->down_burst = down_burst;
+            if (up_speed)
+                tr_pd->up_speed = up_speed;
+            if (up_burst)
+                tr_pd->up_burst = up_burst;
+            continue;
+        }
+        
+        // Проверка и обработка дополнительных шейперов
+        // Ищем атрибуты вида PPPD-Upstream-Speed-Limit-X и PPPD-Downstream-Speed-Limit-X
+        if (attr->attr->type == ATTR_TYPE_STRING || attr->attr->type == ATTR_TYPE_INTEGER) {
+            const char *up_prefix = "PPPD-Upstream-Speed-Limit-";
+            const char *down_prefix = "PPPD-Downstream-Speed-Limit-";
+            const char *attr_name = attr->attr->name;
+            
+            if (strncmp(attr_name, up_prefix, strlen(up_prefix)) == 0) {
+                // Определяем индекс шейпера из имени атрибута
+                specific_idx = atoi(attr_name + strlen(up_prefix));
+                if (specific_idx > 0 && specific_idx <= MAX_SPECIFIC_SHAPERS) {
+                    specific_idx--; // Индексы в массиве начинаются с 0
+                    
+                    // Обработка скорости
+                    if (attr->attr->type == ATTR_TYPE_STRING)
+                        pd->specific_shapers[specific_idx].up_speed = atoi(attr->val.string);
+                    else
+                        pd->specific_shapers[specific_idx].up_speed = attr->val.integer;
+                    
+                    pd->specific_shapers[specific_idx].active = 1;
+                    
+                    // Устанавливаем ipset по умолчанию, если не задан
+                    if (!pd->specific_shapers[specific_idx].dest_ipset) {
+                        char ipset_name[32];
+                        snprintf(ipset_name, sizeof(ipset_name), "shaper_%d", specific_idx + 1);
+                        pd->specific_shapers[specific_idx].dest_ipset = _strdup(ipset_name);
+                    }
+                    
+                    matched_specific = 1;
+                }
+            } 
+            else if (strncmp(attr_name, down_prefix, strlen(down_prefix)) == 0) {
+                // Аналогично для нисходящего трафика
+                specific_idx = atoi(attr_name + strlen(down_prefix));
+                if (specific_idx > 0 && specific_idx <= MAX_SPECIFIC_SHAPERS) {
+                    specific_idx--; // Индексы в массиве начинаются с 0
+                    
+                    // Обработка скорости
+                    if (attr->attr->type == ATTR_TYPE_STRING)
+                        pd->specific_shapers[specific_idx].down_speed = atoi(attr->val.string);
+                    else
+                        pd->specific_shapers[specific_idx].down_speed = attr->val.integer;
+                    
+                    pd->specific_shapers[specific_idx].active = 1;
+                    
+                    // Устанавливаем ipset по умолчанию, если не задан
+                    if (!pd->specific_shapers[specific_idx].dest_ipset) {
+                        char ipset_name[32];
+                        snprintf(ipset_name, sizeof(ipset_name), "shaper_%d", specific_idx + 1);
+                        pd->specific_shapers[specific_idx].dest_ipset = _strdup(ipset_name);
+                    }
+                    
+                    matched_specific = 1;
+                }
+            }
+        }
+    }
 
-	if (!r)
-		return 0;
+    // Обновляем количество активных дополнительных шейперов
+    if (matched_specific) {
+        int count = 0;
+        for (int i = 0; i < MAX_SPECIFIC_SHAPERS; i++) {
+            if (pd->specific_shapers[i].active)
+                count = i + 1;
+        }
+        pd->num_specific_shapers = count;
+        r = 1;
+    }
 
-	// Текущий профиль выбираем с max скоростью
-	struct time_range_pd_t *best = NULL;
-	list_for_each_entry(tr_pd, &pd->tr_list, entry) {
-		if (tr_pd->act) {
-			if (!best || tr_pd->down_speed + tr_pd->up_speed > best->down_speed + best->up_speed)
-				best = tr_pd;
-		}
-	}
+    // Оставшаяся часть существующего кода
+    if (!r)
+        return 0;
 
-	if (best)
-		pd->cur_tr = best;
+    if (!pd->cur_tr)
+        pd->cur_tr = get_tr_pd(pd, 0);
 
-	clear_old_tr_pd(pd);
-	return 1;
+    clear_old_tr_pd(pd);
+
+    return 1;
 }
-
-
-
 
 static void ev_radius_access_accept(struct ev_radius_t *ev)
 {
@@ -464,57 +558,170 @@ static void ev_radius_access_accept(struct ev_radius_t *ev)
 	check_radius_attrs(pd, ev->reply);
 }
 
+static int install_specific_limiter(struct ap_session *ses, int down_speed, int down_burst, int up_speed, int up_burst, int idx, const char *ipset)
+{
+    char cmd[512];
+    int res;
+    
+    // Устанавливаем tc правила для ограничения скорости по направлению трафика
+    // Здесь используется ipset для фильтрации трафика по назначению
+    
+    // Пример команды для нисходящего трафика (download)
+    if (down_speed > 0) {
+        snprintf(cmd, sizeof(cmd), 
+            "tc filter add dev %s parent 1:0 protocol ip prio %d u32 match ip dst @%s flowid 1:%d", 
+            ses->ifname, idx, ipset, idx);
+        res = system(cmd);
+        if (res) {
+            log_ppp_error("shaper: tc filter add for download failed: %d\n", res);
+            return -1;
+        }
+        
+        snprintf(cmd, sizeof(cmd), 
+            "tc class add dev %s parent 1: classid 1:%d htb rate %dkbit ceil %dkbit", 
+            ses->ifname, idx, down_speed, down_speed * 2);
+        res = system(cmd);
+        if (res) {
+            log_ppp_error("shaper: tc class add for download failed: %d\n", res);
+            return -1;
+        }
+    }
+    
+    // Пример команды для восходящего трафика (upload)
+    if (up_speed > 0) {
+        // Для upload нужно использовать фильтр, который будет проверять src адрес клиента
+        // и dst адрес из ipset
+        snprintf(cmd, sizeof(cmd), 
+            "tc filter add dev ifb%d parent 1:0 protocol ip prio %d u32 match ip src %s match ip dst @%s flowid 1:%d", 
+            conf_ifb_ifindex, idx, inet_ntoa(ses->ipv4->addr), ipset, idx);
+        res = system(cmd);
+        if (res) {
+            log_ppp_error("shaper: tc filter add for upload failed: %d\n", res);
+            return -1;
+        }
+        
+        snprintf(cmd, sizeof(cmd), 
+            "tc class add dev ifb%d parent 1: classid 1:%d htb rate %dkbit ceil %dkbit", 
+            conf_ifb_ifindex, idx, up_speed, up_speed * 2);
+        res = system(cmd);
+        if (res) {
+            log_ppp_error("shaper: tc class add for upload failed: %d\n", res);
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+static int remove_specific_limiter(struct ap_session *ses, int idx, const char *ipset)
+{
+    char cmd[512];
+    
+    // Удаляем фильтры и классы для данного шейпера
+    
+    // Удаление правил для нисходящего трафика
+    snprintf(cmd, sizeof(cmd), 
+        "tc filter del dev %s parent 1:0 protocol ip prio %d", 
+        ses->ifname, idx);
+    system(cmd);
+    
+    snprintf(cmd, sizeof(cmd), 
+        "tc class del dev %s parent 1: classid 1:%d", 
+        ses->ifname, idx);
+    system(cmd);
+    
+    // Удаление правил для восходящего трафика
+    snprintf(cmd, sizeof(cmd), 
+        "tc filter del dev ifb%d parent 1:0 protocol ip prio %d", 
+        conf_ifb_ifindex, idx);
+    system(cmd);
+    
+    snprintf(cmd, sizeof(cmd), 
+        "tc class del dev ifb%d parent 1: classid 1:%d", 
+        conf_ifb_ifindex, idx);
+    system(cmd);
+    
+    return 0;
+}
+
 static void ev_radius_coa(struct ev_radius_t *ev)
 {
-	struct shaper_pd_t *pd = find_pd(ev->ses, 0);
+    struct shaper_pd_t *pd = find_pd(ev->ses, 0);
 
-	if (!pd) {
-		ev->res = -1;
-		return;
-	}
+    if (!pd) {
+        ev->res = -1;
+        return;
+    }
 
-	if (!check_radius_attrs(pd, ev->request))
-		return;
+    if (!check_radius_attrs(pd, ev->request))
+        return;
 
-	if (pd->temp_down_speed || pd->temp_up_speed)
-		return;
+    if (pd->temp_down_speed || pd->temp_up_speed)
+        return;
 
-	if (!pd->cur_tr) {
-		if (pd->down_speed || pd->up_speed) {
-			pd->down_speed = 0;
-			pd->up_speed = 0;
-			if (conf_verbose)
-				log_ppp_info2("shaper: removed shaper\n");
-			remove_limiter(ev->ses, pd->idx);
-		}
-		return;
-	}
+    // Обрабатываем основной шейпер (как в оригинальном коде)
+    if (!pd->cur_tr) {
+        if (pd->down_speed || pd->up_speed) {
+            pd->down_speed = 0;
+            pd->up_speed = 0;
+            if (conf_verbose)
+                log_ppp_info2("shaper: removed shaper\n");
+            remove_limiter(ev->ses, pd->idx);
+        }
+    } else if (pd->down_speed != pd->cur_tr->down_speed || pd->up_speed != pd->cur_tr->up_speed) {
+        pd->down_speed = pd->cur_tr->down_speed;
+        pd->up_speed = pd->cur_tr->up_speed;
 
-	if (pd->down_speed != pd->cur_tr->down_speed || pd->up_speed != pd->cur_tr->up_speed) {
-		pd->down_speed = pd->cur_tr->down_speed;
-		pd->up_speed = pd->cur_tr->up_speed;
+        if (pd->idx && remove_limiter(ev->ses, pd->idx)) {
+            ev->res = -1;
+            return;
+        }
 
-		if (pd->idx && remove_limiter(ev->ses, pd->idx)) {
-			ev->res = -1;
-			return;
-		}
+        if (pd->down_speed > 0 || pd->up_speed > 0) {
+            if (!pd->idx)
+                pd->idx = alloc_idx(pd->ses->ifindex);
 
-		if (pd->down_speed > 0 || pd->up_speed > 0) {
-			if (!pd->idx)
-				pd->idx = alloc_idx(pd->ses->ifindex);
+            if (install_limiter(ev->ses, pd->cur_tr->down_speed, pd->cur_tr->down_burst, pd->cur_tr->up_speed, pd->cur_tr->up_burst, pd->idx)) {
+                ev->res= -1;
+                return;
+            } else {
+                if (conf_verbose)
+                    log_ppp_info2("shaper: changed shaper %i/%i (Kbit)\n", pd->down_speed, pd->up_speed);
+            }
+        } else {
+            if (conf_verbose)
+                log_ppp_info2("shaper: removed shaper\n");
+        }
+    }
 
-			if (install_limiter(ev->ses, pd->cur_tr->down_speed, pd->cur_tr->down_burst, pd->cur_tr->up_speed, pd->cur_tr->up_burst, pd->idx)) {
-				ev->res= -1;
-				return;
-			} else {
-				if (conf_verbose)
-					log_ppp_info2("shaper: changed shaper %i/%i (Kbit)\n", pd->down_speed, pd->up_speed);
-			}
-		} else {
-			if (conf_verbose)
-				log_ppp_info2("shaper: removed shaper\n");
-		}
-	}
+    // Обрабатываем дополнительные шейперы
+    for (int i = 0; i < pd->num_specific_shapers; i++) {
+        struct specific_shaper_t *ss = &pd->specific_shapers[i];
+        
+        if (ss->active) {
+            // Удаляем старый лимитер, если он существует и активен
+            if (ss->idx)
+                remove_specific_limiter(ev->ses, ss->idx, ss->dest_ipset);
+            
+            if (ss->down_speed > 0 || ss->up_speed > 0) {
+                if (!ss->idx)
+                    ss->idx = alloc_idx(pd->ses->ifindex + i + 1);
+                
+                if (install_specific_limiter(ev->ses, ss->down_speed, 0, ss->up_speed, 0, ss->idx, ss->dest_ipset)) {
+                    // Ошибка установки лимитера
+                    log_ppp_error("shaper: failed to install specific shaper %d\n", i+1);
+                } else {
+                    if (conf_verbose)
+                        log_ppp_info2("shaper: installed specific shaper %d: %i/%i (Kbit) for %s\n", 
+                                     i+1, ss->down_speed, ss->up_speed, ss->dest_ipset);
+                }
+            }
+        } else if (ss->idx) {
+            // Если шейпер не активен, но ранее был установлен - удаляем его
+            remove_specific_limiter(ev->ses, ss->idx, ss->dest_ipset);
+            ss->idx = 0;
+        }
+    }
 }
 #endif
 
@@ -533,17 +740,10 @@ static void ev_shaper(struct ev_shaper_t *ev)
 	parse_string(ev->val, ATTR_UP, &up_speed, &up_burst, &tr_id);
 
 	tr_pd = get_tr_pd(pd, tr_id);
-
-	if (down_speed)
-		tr_pd->down_speed = down_speed;
-	if (down_burst)
-		tr_pd->down_burst = down_burst;
-	if (up_speed)
-		tr_pd->up_speed = up_speed;
-	if (up_burst)
-		tr_pd->up_burst = up_burst;
-
-	pd->cur_tr = tr_pd; // 👈 обязательно!
+	tr_pd->down_speed = down_speed;
+	tr_pd->down_burst = down_burst;
+	tr_pd->up_speed = up_speed;
+	tr_pd->up_burst = up_burst;
 
 	if (temp_down_speed || temp_up_speed) {
 		pd->temp_down_speed = temp_down_speed;
@@ -555,12 +755,10 @@ static void ev_shaper(struct ev_shaper_t *ev)
 		down_burst = 0;
 		up_burst = 0;
 	} else {
-		pd->down_speed = tr_pd->down_speed;
-		pd->up_speed = tr_pd->up_speed;
-		down_speed = tr_pd->down_speed;
-		up_speed = tr_pd->up_speed;
-		down_burst = tr_pd->down_burst;
-		up_burst = tr_pd->up_burst;
+		if (!pd->cur_tr)
+			return;
+		pd->down_speed = down_speed;
+		pd->up_speed = up_speed;
 	}
 
 	if (!pd->idx)
@@ -573,7 +771,6 @@ static void ev_shaper(struct ev_shaper_t *ev)
 		}
 	}
 }
-
 
 static void ev_ppp_pre_up(struct ap_session *ses)
 {
@@ -624,26 +821,37 @@ static void ev_ppp_pre_up(struct ap_session *ses)
 
 static void ev_ppp_finishing(struct ap_session *ses)
 {
-	struct shaper_pd_t *pd = find_pd(ses, 0);
+    struct shaper_pd_t *pd = find_pd(ses, 0);
 
-	if (pd) {
-		pthread_rwlock_wrlock(&shaper_lock);
-		if (pd->idx)
-			free_idx(pd->idx);
-		list_del(&pd->entry);
-		pthread_rwlock_unlock(&shaper_lock);
+    if (pd) {
+        pthread_rwlock_wrlock(&shaper_lock);
+        if (pd->idx)
+            free_idx(pd->idx);
+            
+        // Очистка дополнительных шейперов
+        for (int i = 0; i < pd->num_specific_shapers; i++) {
+            if (pd->specific_shapers[i].idx) {
+                remove_specific_limiter(ses, pd->specific_shapers[i].idx, pd->specific_shapers[i].dest_ipset);
+                free_idx(pd->specific_shapers[i].idx);
+                if (pd->specific_shapers[i].dest_ipset)
+                    _free(pd->specific_shapers[i].dest_ipset);
+            }
+        }
+        
+        list_del(&pd->entry);
+        pthread_rwlock_unlock(&shaper_lock);
 
-		list_del(&pd->pd.entry);
+        list_del(&pd->pd.entry);
 
-		if (pd->down_speed || pd->up_speed)
-			remove_limiter(ses, pd->idx);
+        if (pd->down_speed || pd->up_speed)
+            remove_limiter(ses, pd->idx);
 
-		if (__sync_sub_and_fetch(&pd->refs, 1) == 0) {
-			clear_tr_pd(pd);
-			_free(pd);
-		} else
-			pd->ses = NULL;
-	}
+        if (__sync_sub_and_fetch(&pd->refs, 1) == 0) {
+            clear_tr_pd(pd);
+            _free(pd);
+        } else
+            pd->ses = NULL;
+    }
 }
 
 static void shaper_change_help(char * const *f, int f_cnt, void *cli)
@@ -828,13 +1036,21 @@ static void shaper_ctx_close(struct triton_context_t *ctx)
 {
 	struct time_range_t *r;
 
+	while (!list_empty(&time_range_list)) {
+		r = list_entry(time_range_list.next, typeof(*r), entry);
+		list_del(&r->entry);
+		if (r->begin.tpd)
+			triton_timer_del(&r->begin);
+		if (r->end.tpd)
+			triton_timer_del(&r->end);
+		_free(r);
+	}
+
 	triton_context_unregister(ctx);
 }
 
-/*static void update_shaper_tr(struct shaper_pd_t *pd)
+static void update_shaper_tr(struct shaper_pd_t *pd)
 {
-	goto out;
-
 	struct time_range_pd_t *tr;
 
 	if (!pd->ses || pd->ses->terminating)
@@ -876,9 +1092,9 @@ out:
 		clear_tr_pd(pd);
 		_free(pd);
 	}
-} */
+}
 
-/*static void time_range_begin_timer(struct triton_timer_t *t)
+static void time_range_begin_timer(struct triton_timer_t *t)
 {
 	struct time_range_t *tr = container_of(t, typeof(*tr), begin);
 	struct shaper_pd_t *pd;
@@ -951,7 +1167,7 @@ static struct time_range_t *parse_range(time_t t, const char *val)
 	r->end.expire = time_range_end_timer;
 
 	return r;
-} */
+}
 
 static int parse_dflt_shaper(const char *opt, int *down_speed, int *up_speed)
 {
@@ -969,7 +1185,7 @@ static int parse_dflt_shaper(const char *opt, int *down_speed, int *up_speed)
 	return 0;
 }
 
-/*static void load_time_ranges(void)
+static void load_time_ranges(void)
 {
 	struct conf_sect_t *s = conf_get_section("shaper");
 	struct conf_option_t *opt;
@@ -1029,7 +1245,7 @@ static int parse_dflt_shaper(const char *opt, int *down_speed, int *up_speed)
 		if (r->end.period)
 			triton_timer_add(&shaper_ctx, &r->end, 1);
 	}
-} */
+}
 
 #ifdef RADIUS
 static int parse_attr_opt(const char *opt)
@@ -1203,7 +1419,7 @@ static void load_config(void)
 	if (opt)
 		parse_dflt_shaper(opt, &dflt_down_speed, &dflt_up_speed);
 
-	//triton_context_call(&shaper_ctx, (triton_event_func)load_time_ranges, NULL);
+	triton_context_call(&shaper_ctx, (triton_event_func)load_time_ranges, NULL);
 }
 
 static void init(void)
