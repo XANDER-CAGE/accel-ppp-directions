@@ -25,9 +25,6 @@
 #include "shaper.h"
 #include "tc_core.h"
 
-extern struct net_t *net;
-
-
 #ifndef __BITS_PER_LONG
 #define __BITS_PER_LONG (sizeof(long) * 8)
 #endif
