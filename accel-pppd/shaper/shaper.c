@@ -73,15 +73,6 @@ static LIST_HEAD(shaper_list);
 
 struct time_range_pd_t;
 
-struct fwmark_limit_t {
-	struct list_head entry;
-	int fwmark;
-	int down_speed;
-	int down_burst;
-	int up_speed;
-	int up_burst;
-};
-
 struct shaper_pd_t {
 	struct list_head entry;
 	struct ap_session *ses;
@@ -170,7 +161,7 @@ static void free_idx(int idx)
 	idx_map[idx / __BITS_PER_LONG] |= 1 << (idx % __BITS_PER_LONG);
 }
 
-static struct shaper_pd_t *find_pd(struct ap_session *ses, int create)
+struct shaper_pd_t *find_pd(struct ap_session *ses, int create)
 {
 	struct ap_private *pd;
 	struct shaper_pd_t *spd;
@@ -685,6 +676,8 @@ static int shaper_change_exec(const char *cmd, char * const *f, int f_cnt, void 
 	struct shaper_pd_t *pd;
 	int down_speed = 0, up_speed = 0, down_burst = 0, up_burst = 0;
 	int all = 0, temp = 0, found = 0;
+	int tr_id = 0;
+
 	//int tr_id;
 
 	if (f_cnt < 4)
