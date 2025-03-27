@@ -833,16 +833,6 @@ static void shaper_ctx_close(struct triton_context_t *ctx)
 {
 	struct time_range_t *r;
 
-	while (!list_empty(&time_range_list)) {
-		r = list_entry(time_range_list.next, typeof(*r), entry);
-		list_del(&r->entry);
-		if (r->begin.tpd)
-			triton_timer_del(&r->begin);
-		if (r->end.tpd)
-			triton_timer_del(&r->end);
-		_free(r);
-	}
-
 	triton_context_unregister(ctx);
 }
 
