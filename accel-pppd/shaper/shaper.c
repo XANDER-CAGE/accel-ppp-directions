@@ -539,10 +539,17 @@ static void ev_shaper(struct ev_shaper_t *ev)
 	parse_string(ev->val, ATTR_UP, &up_speed, &up_burst, &tr_id);
 
 	tr_pd = get_tr_pd(pd, tr_id);
-	tr_pd->down_speed = down_speed;
-	tr_pd->down_burst = down_burst;
-	tr_pd->up_speed = up_speed;
-	tr_pd->up_burst = up_burst;
+
+	if (down_speed)
+		tr_pd->down_speed = down_speed;
+	if (down_burst)
+		tr_pd->down_burst = down_burst;
+	if (up_speed)
+		tr_pd->up_speed = up_speed;
+	if (up_burst)
+		tr_pd->up_burst = up_burst;
+
+	pd->cur_tr = tr_pd; // 👈 обязательно!
 
 	if (temp_down_speed || temp_up_speed) {
 		pd->temp_down_speed = temp_down_speed;
@@ -554,10 +561,12 @@ static void ev_shaper(struct ev_shaper_t *ev)
 		down_burst = 0;
 		up_burst = 0;
 	} else {
-		if (!pd->cur_tr)
-			return;
-		pd->down_speed = down_speed;
-		pd->up_speed = up_speed;
+		pd->down_speed = tr_pd->down_speed;
+		pd->up_speed = tr_pd->up_speed;
+		down_speed = tr_pd->down_speed;
+		up_speed = tr_pd->up_speed;
+		down_burst = tr_pd->down_burst;
+		up_burst = tr_pd->up_burst;
 	}
 
 	if (!pd->idx)
@@ -570,6 +579,7 @@ static void ev_shaper(struct ev_shaper_t *ev)
 		}
 	}
 }
+
 
 static void ev_ppp_pre_up(struct ap_session *ses)
 {
