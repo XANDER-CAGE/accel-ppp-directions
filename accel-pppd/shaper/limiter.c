@@ -538,6 +538,21 @@ static int remove_htb_ifb(struct rtnl_handle *rth, int ifindex, int priority)
 	return tc_qdisc_modify(rth, conf_ifb_ifindex, RTM_DELTCLASS, 0, &opt);
 }
 
+int install_limiter_marked(struct ap_session *ses, int down_speed, int down_burst, int up_speed, int up_burst, int idx, int fwmark) {
+    struct tc_limiter_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    strncpy(cfg.ifname, ses->ifname, sizeof(cfg.ifname) - 1);
+    cfg.down_kbit = down_speed;
+    cfg.down_burst = down_burst;
+    cfg.up_kbit = up_speed;
+    cfg.up_burst = up_burst;
+    cfg.idx = idx;
+    cfg.fwmark = fwmark;
+
+    return tc_install_limiter(&cfg);
+}
+
 int install_limiter(struct ap_session *ses, int down_speed, int down_burst, int up_speed, int up_burst, int idx)
 {
 	struct rtnl_handle *rth = net->rtnl_get();
