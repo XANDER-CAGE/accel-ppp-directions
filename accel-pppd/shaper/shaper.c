@@ -71,38 +71,6 @@ static int dflt_up_speed;
 static pthread_rwlock_t shaper_lock = PTHREAD_RWLOCK_INITIALIZER;
 static LIST_HEAD(shaper_list);
 
-struct fwmark_class_t {
-	struct list_head entry;
-	int id; // N
-	int mark; // 0x100 + N
-	int down_speed;
-	int up_speed;
-	int created;
-};
-
-static LIST_HEAD(fwmark_class_list);
-
-static struct fwmark_class_t *get_fwmark_class(int id)
-{
-	struct fwmark_class_t *cls;
-
-	list_for_each_entry(cls, &fwmark_class_list, entry) {
-		if (cls->id == id)
-			return cls;
-	}
-
-	cls = _malloc(sizeof(*cls));
-	if (!cls)
-		return NULL;
-
-	memset(cls, 0, sizeof(*cls));
-	cls->id = id;
-	cls->mark = 0x100 + id;
-
-	list_add_tail(&cls->entry, &fwmark_class_list);
-	return cls;
-}
-
 struct time_range_pd_t;
 struct shaper_pd_t {
 	struct list_head entry;
@@ -138,7 +106,7 @@ struct time_range_t {
 static void *pd_key;
 
 static LIST_HEAD(time_range_list);
-static int time_range_id = 0;
+//static int time_range_id = 0;
 
 #define MAX_IDX 65536
 static long *idx_map;
@@ -148,35 +116,6 @@ static struct triton_context_t shaper_ctx = {
 	.close = shaper_ctx_close,
 	.before_switch = log_switch,
 };
-
-static int install_fwmark_limiter(int ifindex, int mark, int down_speed, int up_speed) {
-	int down_burst = conf_down_burst_factor * down_speed * 1000 / 8;
-	int up_burst = conf_up_burst_factor * up_speed * 1000 / 8;
-	int idx = mark & 0xFF; // чтобы использовать как уникальный id класса
-
-	if (down_speed > 0) {
-		if (conf_down_limiter == LIM_HTB) {
-			if (install_htb(net->rtnl_get(), ifindex, down_speed * 1000 / 8, down_burst))
-				return -1;
-				install_fwmark(net->rtnl_get(), ifindex, mark); // фильтр fwmark -> classid 1:
-		} else if (conf_down_limiter == LIM_TBF) {
-			if (install_tbf(net->rtnl_get(), ifindex, down_speed * 1000 / 8, down_burst))
-				return -1;
-		}
-	}
-
-	if (up_speed > 0) {
-		if (conf_up_limiter == LIM_HTB) {
-			if (install_htb_ifb(net->rtnl_get(), ifindex, idx, up_speed * 1000 / 8, up_burst))
-				return -1;
-		} else {
-			if (install_police(net->rtnl_get(), ifindex, up_speed * 1000 / 8, up_burst))
-				return -1;
-		}
-	}
-
-	return 0;
-}
 
 static int alloc_idx(int init)
 {
@@ -398,8 +337,10 @@ static struct time_range_pd_t *get_tr_pd(struct shaper_pd_t *pd, int id)
 	tr_pd->id = id;
 	tr_pd->act = 1;
 
-	if (id == time_range_id)
-		pd->cur_tr = tr_pd;
+	//if (id == time_range_id)
+	//	pd->cur_tr = tr_pd;
+
+	pd->cur_tr = tr_pd;
 
 	list_add_tail(&tr_pd->entry, &pd->tr_list);
 
@@ -452,80 +393,72 @@ static void parse_attr(struct rad_attr_t *attr, int dir, int *speed, int *burst,
 static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 {
 	struct rad_attr_t *attr;
-	int down_speed, down_burst;
-	int up_speed, up_burst;
-	int tr_id;
-	struct time_range_pd_t *tr_pd;
+	int tr_id = 0;
+	int down_speed = 0, down_burst = 0;
+	int up_speed = 0, up_burst = 0;
+	struct time_range_pd_t *tr_pd = NULL;
 	int r = 0;
 
+	// Помечаем все старые записи как неактивные
 	list_for_each_entry(tr_pd, &pd->tr_list, entry)
 		tr_pd->act = 0;
 
 	pd->cur_tr = NULL;
 
 	list_for_each_entry(attr, &pack->attrs, entry) {
-		const char *name = attr->attr->name;
-		if (!name) continue;
-
-		int n = 0, rate = 0;
-		if (sscanf(name, "PPPD-Downstream-Speed-Limit-%d", &n) == 1) {
-			rate = attr->val.integer;
-		} else if (sscanf(name, "PPPD-Upstream-Speed-Limit-%d", &n) == 1) {
-			rate = attr->val.integer;
-		}
-
-		if (n > 0 && rate > 0) {
-			int mark = 0x100 + n;
-			struct fwmark_class_t *cls = get_fwmark_class(n);
-			if (!cls)
-				continue;
-		
-			if (!cls->created) {
-				if (install_fwmark_limiter(...)) continue;
-				cls->created = 1;
-			}
-			if (strstr(name, "Down"))
-				cls->down_speed = rate;
-			if (strstr(name, "Up"))
-				cls->up_speed = rate;
-				
 		if (attr->vendor && attr->vendor->id != conf_vendor)
 			continue;
 		if (!attr->vendor && conf_vendor)
 			continue;
-		if (attr->attr->id != conf_attr_down && attr->attr->id != conf_attr_up)
-			continue;
-		r = 1;
-		tr_id = 0;
-		down_speed = 0;
-		down_burst = 0;
-		up_speed = 0;
-		up_burst = 0;
-		if (attr->attr->id == conf_attr_down)
-			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, &tr_id);
-		if (attr->attr->id == conf_attr_up)
-			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, &tr_id);
-		tr_pd = get_tr_pd(pd, tr_id);
-		if (down_speed)
-			tr_pd->down_speed = down_speed;
-		if (down_burst)
-			tr_pd->down_burst = down_burst;
-		if (up_speed)
-			tr_pd->up_speed = up_speed;
-		if (up_burst)
-			tr_pd->up_burst = up_burst;
+
+		// Downstream
+		if (strncmp(attr->attr->name, "PPPD-Downstream-Speed-Limit", 28) == 0) {
+			tr_id = atoi(attr->attr->name + 28);
+			down_speed = down_burst = 0;
+			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, NULL);
+
+			if (!tr_pd || tr_pd->id != tr_id)
+				tr_pd = get_tr_pd(pd, tr_id);
+
+			if (down_speed)
+				tr_pd->down_speed = down_speed;
+			if (down_burst)
+				tr_pd->down_burst = down_burst;
+
+			r = 1;
+		}
+
+		// Upstream
+		else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
+			tr_id = atoi(attr->attr->name + 26);
+			up_speed = up_burst = 0;
+			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, NULL);
+
+			if (!tr_pd || tr_pd->id != tr_id)
+				tr_pd = get_tr_pd(pd, tr_id);
+
+			if (up_speed)
+				tr_pd->up_speed = up_speed;
+			if (up_burst)
+				tr_pd->up_burst = up_burst;
+
+			r = 1;
+		}
 	}
 
 	if (!r)
 		return 0;
 
-	if (!pd->cur_tr)
-		pd->cur_tr = get_tr_pd(pd, 0);
+	if (tr_pd) {
+		pd->cur_tr = tr_pd; // активный профиль
+		tr_pd->act = 1;
+	}
 
 	clear_old_tr_pd(pd);
 
 	return 1;
 }
+
 
 static void ev_radius_access_accept(struct ev_radius_t *ev)
 {
@@ -906,6 +839,8 @@ static void shaper_ctx_close(struct triton_context_t *ctx)
 
 static void update_shaper_tr(struct shaper_pd_t *pd)
 {
+	goto out;
+
 	struct time_range_pd_t *tr;
 
 	if (!pd->ses || pd->ses->terminating)
