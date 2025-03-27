@@ -395,14 +395,12 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 	int tr_id = 0;
 	int down_speed = 0, down_burst = 0;
 	int up_speed = 0, up_burst = 0;
-	struct time_range_pd_t *tr_pd = NULL;
 	int r = 0;
+	int max_tr_id = -1;
 
 	// Помечаем все старые записи как неактивные
-	list_for_each_entry(tr_pd, &pd->tr_list, entry)
+	list_for_each_entry(struct time_range_pd_t *tr_pd, &pd->tr_list, entry)
 		tr_pd->act = 0;
-
-	pd->cur_tr = NULL;
 
 	list_for_each_entry(attr, &pack->attrs, entry) {
 		if (attr->vendor && attr->vendor->id != conf_vendor)
@@ -410,37 +408,23 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 		if (!attr->vendor && conf_vendor)
 			continue;
 
-		// Downstream
 		if (strncmp(attr->attr->name, "PPPD-Downstream-Speed-Limit", 28) == 0) {
 			tr_id = atoi(attr->attr->name + 28);
-			down_speed = down_burst = 0;
 			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, NULL);
-
-			if (!tr_pd || tr_pd->id != tr_id)
-				tr_pd = get_tr_pd(pd, tr_id);
-
-			if (down_speed)
-				tr_pd->down_speed = down_speed;
-			if (down_burst)
-				tr_pd->down_burst = down_burst;
-
+			struct time_range_pd_t *tr_pd = get_tr_pd(pd, tr_id);
+			if (down_speed) tr_pd->down_speed = down_speed;
+			if (down_burst) tr_pd->down_burst = down_burst;
+			tr_pd->act = 1;
+			if (tr_id > max_tr_id) max_tr_id = tr_id;
 			r = 1;
-		}
-
-		// Upstream
-		else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
+		} else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
 			tr_id = atoi(attr->attr->name + 26);
-			up_speed = up_burst = 0;
 			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, NULL);
-
-			if (!tr_pd || tr_pd->id != tr_id)
-				tr_pd = get_tr_pd(pd, tr_id);
-
-			if (up_speed)
-				tr_pd->up_speed = up_speed;
-			if (up_burst)
-				tr_pd->up_burst = up_burst;
-
+			struct time_range_pd_t *tr_pd = get_tr_pd(pd, tr_id);
+			if (up_speed) tr_pd->up_speed = up_speed;
+			if (up_burst) tr_pd->up_burst = up_burst;
+			tr_pd->act = 1;
+			if (tr_id > max_tr_id) max_tr_id = tr_id;
 			r = 1;
 		}
 	}
@@ -448,15 +432,13 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 	if (!r)
 		return 0;
 
-	if (tr_pd) {
-		pd->cur_tr = tr_pd; // активный профиль
-		tr_pd->act = 1;
-	}
+	if (max_tr_id >= 0)
+		pd->cur_tr = get_tr_pd(pd, max_tr_id);
 
 	clear_old_tr_pd(pd);
-
 	return 1;
 }
+
 
 
 static void ev_radius_access_accept(struct ev_radius_t *ev)
