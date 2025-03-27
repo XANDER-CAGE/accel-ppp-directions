@@ -392,14 +392,15 @@ static void parse_attr(struct rad_attr_t *attr, int dir, int *speed, int *burst,
 static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 {
 	struct rad_attr_t *attr;
+	struct time_range_pd_t *tr_pd;
 	int tr_id = 0;
 	int down_speed = 0, down_burst = 0;
 	int up_speed = 0, up_burst = 0;
 	int r = 0;
 	int max_tr_id = -1;
 
-	// Помечаем все старые записи как неактивные
-	list_for_each_entry(struct time_range_pd_t *tr_pd, &pd->tr_list, entry)
+	// 👇 сначала объявляем переменную, потом используем
+	list_for_each_entry(tr_pd, &pd->tr_list, entry)
 		tr_pd->act = 0;
 
 	list_for_each_entry(attr, &pack->attrs, entry) {
@@ -411,7 +412,7 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 		if (strncmp(attr->attr->name, "PPPD-Downstream-Speed-Limit", 28) == 0) {
 			tr_id = atoi(attr->attr->name + 28);
 			parse_attr(attr, ATTR_DOWN, &down_speed, &down_burst, NULL);
-			struct time_range_pd_t *tr_pd = get_tr_pd(pd, tr_id);
+			tr_pd = get_tr_pd(pd, tr_id);
 			if (down_speed) tr_pd->down_speed = down_speed;
 			if (down_burst) tr_pd->down_burst = down_burst;
 			tr_pd->act = 1;
@@ -420,7 +421,7 @@ static int check_radius_attrs(struct shaper_pd_t *pd, struct rad_packet_t *pack)
 		} else if (strncmp(attr->attr->name, "PPPD-Upstream-Speed-Limit", 26) == 0) {
 			tr_id = atoi(attr->attr->name + 26);
 			parse_attr(attr, ATTR_UP, &up_speed, &up_burst, NULL);
-			struct time_range_pd_t *tr_pd = get_tr_pd(pd, tr_id);
+			tr_pd = get_tr_pd(pd, tr_id);
 			if (up_speed) tr_pd->up_speed = up_speed;
 			if (up_burst) tr_pd->up_burst = up_burst;
 			tr_pd->act = 1;
